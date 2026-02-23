@@ -18,6 +18,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 #include <errno.h>
+#include <libgen.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -78,6 +79,7 @@
 
 static void do_get_action(struct pmc *pmc, int action, int index, char *str);
 static void do_set_action(struct pmc *pmc, int action, int index, char *str);
+static void do_command_action(struct pmc *pmc, int action, int index, char *str);
 static void not_supported(struct pmc *pmc, int action, int index, char *str);
 static void null_management(struct pmc *pmc, int action, int index, char *str);
 
@@ -141,8 +143,8 @@ struct management_id idtab[] = {
 	{ "ANNOUNCE_RECEIPT_TIMEOUT", MID_ANNOUNCE_RECEIPT_TIMEOUT, do_get_action },
 	{ "LOG_SYNC_INTERVAL", MID_LOG_SYNC_INTERVAL, do_get_action },
 	{ "VERSION_NUMBER", MID_VERSION_NUMBER, do_get_action },
-	{ "ENABLE_PORT", MID_ENABLE_PORT, not_supported },
-	{ "DISABLE_PORT", MID_DISABLE_PORT, not_supported },
+	{ "ENABLE_PORT", MID_ENABLE_PORT, do_command_action },
+	{ "DISABLE_PORT", MID_DISABLE_PORT, do_command_action },
 	{ "UNICAST_NEGOTIATION_ENABLE", MID_UNICAST_NEGOTIATION_ENABLE, not_supported },
 	{ "UNICAST_MASTER_TABLE", MID_UNICAST_MASTER_TABLE, not_supported },
 	{ "UNICAST_MASTER_MAX_TABLE_SIZE", MID_UNICAST_MASTER_MAX_TABLE_SIZE, not_supported },
@@ -439,6 +441,19 @@ static void do_set_action(struct pmc *pmc, int action, int index, char *str)
 	}
 }
 
+static void do_command_action(struct pmc *pmc, int action, int index, char *str)
+{
+	int code = idtab[index].code;
+
+	if (action != COMMAND) {
+		fprintf(stderr, "%s only allows COMMAND\n",
+			idtab[index].name);
+		return;
+	}
+
+	pmc_send_command_action(pmc, code);
+}
+
 static void not_supported(struct pmc *pmc, int action, int index, char *str)
 {
 	fprintf(stdout, "sorry, %s not supported yet\n", idtab[index].name);
@@ -535,12 +550,38 @@ struct pmc {
 	UInteger8 allow_unauth;
 };
 
+static int complete_uds_address(struct config *cfg, const char *iface,
+				char *uds, size_t len)
+{
+	char buf[MAX_IFNAME_SIZE + 1];
+
+	/* Don't change absolute paths */
+	if (iface[0] == '/') {
+		if (snprintf(uds, len, "%s", iface) >= len) {
+			pr_err("UDS path too long");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* Relative paths are relative to the directory of the server socket */
+	if (snprintf(buf, sizeof(buf), "%s", config_get_string(cfg, NULL,
+					     "uds_address")) >= sizeof(buf) ||
+	    snprintf(uds, len, "%s/%s", dirname(buf), iface) >= len) {
+		pr_err("UDS path too long");
+		return -1;
+	}
+
+	return 0;
+}
+
 struct pmc *pmc_create(struct config *cfg, enum transport_type transport_type,
 		       const char *iface_name, const char *remote_address,
 		       UInteger8 boundary_hops, UInteger8 domain_number,
 		       UInteger8 transport_specific, UInteger8 allow_unauth,
 		       int zero_datalen)
 {
+	char uds[MAX_IFNAME_SIZE + 1];
 	struct pmc *pmc;
 	UInteger32 proc_id;
 
@@ -553,6 +594,9 @@ struct pmc *pmc_create(struct config *cfg, enum transport_type transport_type,
 		pmc->port_identity.clockIdentity.id[6] = (proc_id & 0xFF000000) >> 24;
 		pmc->port_identity.clockIdentity.id[7] = (proc_id & 0x00FF0000) >> 16;
 		pmc->port_identity.portNumber = proc_id & 0xFFFF;
+		if (complete_uds_address(cfg, iface_name, uds, sizeof(uds)))
+			goto failed;
+		iface_name = uds;
 	} else {
 		if (generate_clock_identity(&pmc->port_identity.clockIdentity,
 					    iface_name)) {
@@ -868,6 +912,31 @@ int pmc_send_set_aton(struct pmc *pmc, int id, uint8_t key, const char *name)
 	aton->keyField = key;
 	ptp_text_set(&aton->displayName, name);
 
+	pmc_send(pmc, msg);
+	msg_put(msg);
+
+	return 0;
+}
+
+int pmc_send_command_action(struct pmc *pmc, int id)
+{
+	struct management_tlv *mgt;
+	struct ptp_message *msg;
+	struct tlv_extra *extra;
+
+	msg = pmc_message(pmc, COMMAND);
+	if (!msg) {
+		return -1;
+	}
+	extra = msg_tlv_append(msg, sizeof(*mgt));
+	if (!extra) {
+		msg_put(msg);
+		return -ENOMEM;
+	}
+	mgt = (struct management_tlv *) extra->tlv;
+	mgt->type = TLV_MANAGEMENT;
+	mgt->length = 2;
+	mgt->id = id;
 	pmc_send(pmc, msg);
 	msg_put(msg);
 

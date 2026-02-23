@@ -82,6 +82,7 @@ struct port {
 	struct ptp_message *last_syncfup;
 	TAILQ_HEAD(delay_req, ptp_message) delay_req;
 	struct ptp_message *peer_delay_req;
+	int peer_delay_req_flushed;
 	struct ptp_message *peer_delay_resp;
 	struct ptp_message *peer_delay_fup;
 	int peer_portid_valid;
@@ -144,6 +145,7 @@ struct port {
 	struct fault_interval flt_interval_pertype[FT_CNT];
 	enum fault_type     last_fault_type;
 	UInteger8           versionNumber; /* UInteger4 */
+	double              delay_request_variability;
 	UInteger8	    delay_response_counter;
 	UInteger8	    delay_response_timeout;
 	UInteger8	    allowedLostResponses;

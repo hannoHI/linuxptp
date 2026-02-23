@@ -35,6 +35,9 @@
 
 #define FREQ_EST_MARGIN 0.001
 
+#define RAMP_DEFAULT_MULTIPLIER 3.0
+#define RAMP_LOG_INTERVAL_NS    60000000000ULL  /* log progress every 60s */
+
 struct pi_servo {
 	struct servo servo;
 	int64_t offset[2];
@@ -44,6 +47,15 @@ struct pi_servo {
 	double ki;
 	double last_freq;
 	int count;
+	/* gain ramping: */
+	int ramp_active;
+	uint64_t ramp_start_ts;
+	uint64_t ramp_last_log_ts;
+	double ramp_duration_ns;
+	double ramp_start_kp;
+	double ramp_start_ki;
+	double ramp_cfg_start_kp;
+	double ramp_cfg_start_ki;
 	/* configuration: */
 	double configured_pi_kp;
 	double configured_pi_ki;
@@ -121,6 +133,24 @@ static double pi_sample(struct servo *servo,
 
 		ppb = s->drift;
 		s->count = 2;
+
+		/* Start gain ramp on first lock */
+		if (s->ramp_duration_ns > 0.0) {
+			s->ramp_active = 1;
+			s->ramp_start_ts = local_ts;
+			s->ramp_last_log_ts = local_ts;
+			s->ramp_start_kp = s->ramp_cfg_start_kp > 0.0 ?
+				s->ramp_cfg_start_kp :
+				s->kp * RAMP_DEFAULT_MULTIPLIER;
+			s->ramp_start_ki = s->ramp_cfg_start_ki > 0.0 ?
+				s->ramp_cfg_start_ki :
+				s->ki * RAMP_DEFAULT_MULTIPLIER;
+			pr_info("PI gain ramp started: %.0fs from "
+				"kp=%.4f ki=%.6f to kp=%.4f ki=%.6f",
+				s->ramp_duration_ns / 1e9,
+				s->ramp_start_kp, s->ramp_start_ki,
+				s->kp, s->ki);
+		}
 		break;
 	case 2:
 		/*
@@ -134,11 +164,43 @@ static double pi_sample(struct servo *servo,
 		    servo->step_threshold < llabs(offset)) {
 			*state = SERVO_UNLOCKED;
 			s->count = 0;
+			s->ramp_active = 0;
 			break;
 		}
 
-		ki_term = s->ki * offset * weight;
-		ppb = s->kp * offset * weight + s->drift + ki_term;
+		{
+			double eff_kp = s->kp;
+			double eff_ki = s->ki;
+
+			if (s->ramp_active) {
+				double elapsed = (double)(local_ts - s->ramp_start_ts);
+				double progress = elapsed / s->ramp_duration_ns;
+
+				if (progress >= 1.0) {
+					s->ramp_active = 0;
+					pr_info("PI gain ramp complete: "
+						"kp=%.4f ki=%.6f",
+						s->kp, s->ki);
+				} else {
+					eff_kp = s->ramp_start_kp +
+						(s->kp - s->ramp_start_kp) * progress;
+					eff_ki = s->ramp_start_ki +
+						(s->ki - s->ramp_start_ki) * progress;
+
+					if ((local_ts - s->ramp_last_log_ts) >=
+					    RAMP_LOG_INTERVAL_NS) {
+						pr_info("PI gain ramp %3.0f%%: "
+							"kp=%.4f ki=%.6f",
+							progress * 100.0,
+							eff_kp, eff_ki);
+						s->ramp_last_log_ts = local_ts;
+					}
+				}
+			}
+
+			ki_term = eff_ki * offset * weight;
+			ppb = eff_kp * offset * weight + s->drift + ki_term;
+		}
 		if (ppb < -servo->max_frequency) {
 			ppb = -servo->max_frequency;
 		} else if (ppb > servo->max_frequency) {
@@ -175,6 +237,7 @@ static void pi_reset(struct servo *servo)
 	struct pi_servo *s = container_of(servo, struct pi_servo, servo);
 
 	s->count = 0;
+	s->ramp_active = 0;
 }
 
 struct servo *pi_servo_create(struct config *cfg, double fadj, int sw_ts)
@@ -206,6 +269,14 @@ struct servo *pi_servo_create(struct config *cfg, double fadj, int sw_ts)
 		config_get_double(cfg, NULL, "pi_integral_exponent");
 	s->configured_pi_ki_norm_max =
 		config_get_double(cfg, NULL, "pi_integral_norm_max");
+
+	s->ramp_duration_ns =
+		config_get_double(cfg, NULL, "pi_gain_ramp_duration") * 1e9;
+	s->ramp_cfg_start_kp =
+		config_get_double(cfg, NULL, "pi_gain_ramp_kp");
+	s->ramp_cfg_start_ki =
+		config_get_double(cfg, NULL, "pi_gain_ramp_ki");
+	s->ramp_active = 0;
 
 	if (s->configured_pi_kp && s->configured_pi_ki) {
 		/* Use the constants as configured by the user without

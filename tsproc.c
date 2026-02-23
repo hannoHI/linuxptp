@@ -211,6 +211,7 @@ int tsproc_update_offset(struct tsproc *tsp, tmv_t *offset, double *weight)
 
 	/* offset = t2 - t1 - delay */
 	*offset = tmv_sub(tmv_sub(tsp->t2, tsp->t1), delay);
+	pr_debug("offset raw %10" PRId64, tmv_to_nanoseconds(*offset));
 
 	if (!weight)
 		return 0;

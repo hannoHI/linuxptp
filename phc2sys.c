@@ -37,6 +37,8 @@
 #include <linux/pps.h>
 #include <linux/ptp_clock.h>
 
+#include <math.h>
+
 #include "clockadj.h"
 #include "clockcheck.h"
 #include "contain.h"
@@ -856,7 +858,40 @@ static int do_loop(struct domain *domains, int n_domains)
 	interval.tv_nsec = (domains[0].phc_interval - interval.tv_sec) * 1e9;
 
 	while (is_running()) {
-		clock_nanosleep(CLOCK_MONOTONIC, 0, &interval, NULL);
+		{
+			struct timespec now;
+			clock_gettime(CLOCK_REALTIME, &now);
+			double current_seconds = now.tv_sec + (now.tv_nsec / 1.0e9);
+			double seconds_in_minute = fmod(current_seconds, 60.0);
+			double next_mark;
+			if (seconds_in_minute < 7.5)
+				next_mark = floor(current_seconds / 60.0) * 60.0 + 7.5;
+			else if (seconds_in_minute < 22.5)
+				next_mark = floor(current_seconds / 60.0) * 60.0 + 22.5;
+			else if (seconds_in_minute < 37.5)
+				next_mark = floor(current_seconds / 60.0) * 60.0 + 37.5;
+			else if (seconds_in_minute < 52.5)
+				next_mark = floor(current_seconds / 60.0) * 60.0 + 52.5;
+			else
+				next_mark = floor(current_seconds / 60.0 + 1.0) * 60.0 + 7.5;
+
+			double sleep_duration = next_mark - current_seconds;
+			struct timespec sleep_interval;
+			sleep_interval.tv_sec = (time_t)sleep_duration;
+			sleep_interval.tv_nsec = (long)((sleep_duration - sleep_interval.tv_sec) * 1.0e9);
+			clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_interval, NULL);
+		}
+
+		{
+			struct timespec log_time;
+			char time_str[64];
+			struct tm tm;
+
+			clock_gettime(CLOCK_REALTIME, &log_time);
+			localtime_r(&log_time.tv_sec, &tm);
+			strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm);
+			pr_info("Current time: %s.%09ld", time_str, log_time.tv_nsec);
+		}
 
 		state_changed = 0;
 		for (i = 0; i < n_domains; i++) {
@@ -1554,8 +1589,7 @@ int main(int argc, char *argv[])
 	r = -1;
 
 	if (wait_sync || !domains[0].forced_sync_offset) {
-		snprintf(uds_local, sizeof(uds_local),
-			 "/var/run/phc2sys.%d", getpid());
+		snprintf(uds_local, sizeof(uds_local), "/var/run/phc2sys.%d", getpid());
 
 		if (uds_remote_cnt > 0)
 			config_set_string(cfg, "uds_address",

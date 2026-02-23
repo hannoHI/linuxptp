@@ -42,13 +42,35 @@
 #include "tlv.h"
 #include "tmv.h"
 #include "tsproc.h"
+#include "shared_ptp.h"
 #include "unicast_client.h"
 #include "unicast_service.h"
 #include "util.h"
 
+/* External shared PTP data variables */
+extern int ptp_shared_memory_id, ptp_semaphore_id;
+extern struct SharedPtpData *shared_ptp_data;
+
 #define ANNOUNCE_SPAN 1
 #define CMLDS_SUBSCRIPTION_INTERVAL	60 /*seconds*/
 #define CMLDS_UPDATE_INTERVAL		(CMLDS_SUBSCRIPTION_INTERVAL / 2)
+
+static const char* port_state_string(enum port_state state)
+{
+	switch (state) {
+	case PS_INITIALIZING:  return "INITIALIZING";
+	case PS_FAULTY:        return "FAULTY";
+	case PS_DISABLED:      return "DISABLED";
+	case PS_LISTENING:     return "LISTENING";
+	case PS_PRE_MASTER:    return "PRE_MASTER";
+	case PS_MASTER:        return "MASTER";
+	case PS_PASSIVE:       return "PASSIVE";
+	case PS_UNCALIBRATED:  return "UNCALIBRATED";
+	case PS_SLAVE:         return "SLAVE";
+	case PS_GRAND_MASTER:  return "GRAND_MASTER";
+	default:               return "UNKNOWN";
+	}
+}
 
 enum syfu_event {
 	SYNC_MISMATCH,
@@ -268,7 +290,7 @@ int set_tmo_lin(int fd, int seconds)
 	return timerfd_settime(fd, 0, &tmo, NULL);
 }
 
-int set_tmo_random(int fd, int min, int span, int log_seconds)
+int set_tmo_random(int fd, double min, double span, int log_seconds)
 {
 	uint64_t value_ns, min_ns, span_ns;
 	struct itimerspec tmo = {
@@ -276,11 +298,11 @@ int set_tmo_random(int fd, int min, int span, int log_seconds)
 	};
 
 	if (log_seconds >= 0) {
-		min_ns = min * NS_PER_SEC << log_seconds;
-		span_ns = span * NS_PER_SEC << log_seconds;
+		min_ns = (uint64_t)(min * NS_PER_SEC) << log_seconds;
+		span_ns = (uint64_t)(span * NS_PER_SEC) << log_seconds;
 	} else {
-		min_ns = min * NS_PER_SEC >> -log_seconds;
-		span_ns = span * NS_PER_SEC >> -log_seconds;
+		min_ns = (uint64_t)(min * NS_PER_SEC) >> -log_seconds;
+		span_ns = (uint64_t)(span * NS_PER_SEC) >> -log_seconds;
 	}
 
 	value_ns = min_ns + (span_ns * (random() % (1 << 15) + 1) >> 15);
@@ -942,6 +964,8 @@ static int port_management_fill_response(struct port *target,
 
 	switch (id) {
 	case MID_NULL_MANAGEMENT:
+	case MID_ENABLE_PORT:
+	case MID_DISABLE_PORT:
 		datalen = 0;
 		break;
 	case MID_CLOCK_DESCRIPTION:
@@ -1257,6 +1281,27 @@ static int port_management_set(struct port *target,
 	return respond ? 1 : 0;
 }
 
+static int port_management_command(struct port *target,
+				   struct port *ingress, int id,
+				   struct ptp_message *req)
+{
+	switch (id) {
+	case MID_ENABLE_PORT:
+		port_dispatch(target, EV_DESIGNATED_ENABLED, 0);
+		break;
+	case MID_DISABLE_PORT:
+		port_dispatch(target, EV_DESIGNATED_DISABLED, 0);
+		break;
+	default:
+		return 0;
+	}
+
+	if (!port_management_get_response(target, ingress, id, req))
+		pr_err("%s: failed to send management acknowledgement",
+		       target->log_name);
+	return 1;
+}
+
 static void port_nrate_calculate(struct port *p, tmv_t origin, tmv_t ingress)
 {
 	struct nrate_estimator *n = &p->nrate;
@@ -1333,7 +1378,9 @@ int port_set_delay_tmo(struct port *p)
 	default:
 		break;
 	}
-	return set_tmo_random(p->fda.fd[FD_DELAY_TIMER], 0, 2,
+	return set_tmo_random(p->fda.fd[FD_DELAY_TIMER],
+			      1.0 - p->delay_request_variability,
+			      2.0 * p->delay_request_variability,
 			      p->logMinDelayReqInterval);
 }
 
@@ -1949,6 +1996,7 @@ static void flush_peer_delay(struct port *p)
 	if (p->peer_delay_req) {
 		msg_put(p->peer_delay_req);
 		p->peer_delay_req = NULL;
+		p->peer_delay_req_flushed = 1;
 	}
 	if (p->peer_delay_resp) {
 		msg_put(p->peer_delay_resp);
@@ -1993,6 +2041,20 @@ static int port_cmlds_initialize(struct port *p)
 	p->fda.fd[FD_CMLDS] = pmc_get_transport_fd(p->cmlds.pmc);
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	return port_cmlds_renew(p, now.tv_sec);
+}
+
+static void port_rtnl_initialize(struct port *p)
+{
+	/* Reopen the socket to get rid of buffered messages */
+	if (p->fda.fd[FD_RTNL] >= 0) {
+		rtnl_close(p->fda.fd[FD_RTNL]);
+	}
+	p->fda.fd[FD_RTNL] = rtnl_open();
+	if (p->fda.fd[FD_RTNL] >= 0) {
+		rtnl_link_query(p->fda.fd[FD_RTNL], interface_name(p->iface));
+	}
+
+	clock_fda_changed(p->clock);
 }
 
 void port_disable(struct port *p)
@@ -2052,6 +2114,7 @@ int port_initialize(struct port *p)
 	p->operLogPdelayReqInterval = config_get_int(cfg, p->name, "operLogPdelayReqInterval");
 	p->neighborPropDelayThresh = config_get_int(cfg, p->name, "neighborPropDelayThresh");
 	p->min_neighbor_prop_delay = config_get_int(cfg, p->name, "min_neighbor_prop_delay");
+	p->delay_request_variability = config_get_double(cfg, p->name, "delay_request_variability");
 	p->delay_response_timeout  = config_get_int(cfg, p->name, "delay_response_timeout");
 	p->iface_rate_tlv 	   = config_get_int(cfg, p->name, "interface_rate_tlv");
 
@@ -2108,13 +2171,8 @@ int port_initialize(struct port *p)
 		if (p->bmca == BMCA_NOOP) {
 			port_set_delay_tmo(p);
 		}
-		if (p->fda.fd[FD_RTNL] == -1) {
-			p->fda.fd[FD_RTNL] = rtnl_open();
-		}
-		if (p->fda.fd[FD_RTNL] >= 0) {
-			const char *ifname = interface_name(p->iface);
-			rtnl_link_query(p->fda.fd[FD_RTNL], ifname);
-		}
+
+		port_rtnl_initialize(p);
 	}
 
 	port_nrate_initialize(p);
@@ -2688,8 +2746,15 @@ int process_pdelay_resp(struct port *p, struct ptp_message *m)
         }
 
 	if (!p->peer_delay_req) {
+		if (p->peer_delay_req_flushed) {
+			pr_notice("%s: peer delay response ignored because of previous flush", p->log_name);
+			p->peer_delay_req_flushed = 0;
+			return 0;
+		}
 		pr_err("%s: rogue peer delay response", p->log_name);
 		return -1;
+	} else {
+		p->peer_delay_req_flushed = 0;
 	}
 	if (p->peer_portid_valid) {
 		if (!pid_eq(&p->peer_portid, &m->header.sourcePortIdentity)) {
@@ -3245,7 +3310,7 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		}
 		return EV_NONE;
 	}
-	if (msg_sots_valid(msg)) {
+	if (msg_type(msg) == SIGNALING || msg_sots_valid(msg)) {
 		ts_add(&msg->hwts.ts, -p->rx_timestamp_offset);
 		if (p->state == PS_SLAVE) {
 			clock_check_ts(p->clock,
@@ -3392,6 +3457,8 @@ int port_manage(struct port *p, struct port *ingress, struct ptp_message *msg)
 			return 1;
 		break;
 	case COMMAND:
+		if (port_management_command(p, ingress, mgt->id, msg))
+			return 1;
 		break;
 	default:
 		return -1;
@@ -3794,6 +3861,13 @@ int port_state_update(struct port *p, enum fsm_event event, int mdiff)
 		if (port_link_status_get(p) && clear_fault_asap(&i)) {
 			pr_notice("%s: clearing fault immediately", p->log_name);
 			next = p->state_machine(next, EV_FAULT_CLEARED, 0);
+		} else if (event == EV_FAULT_DETECTED) {
+			/*
+			 * Reopen the netlink socket and refresh the link
+			 * status in case the fault was triggered by a missed
+			 * netlink message (ENOBUFS).
+			 */
+			port_rtnl_initialize(p);
 		}
 	}
 
@@ -3822,6 +3896,15 @@ int port_state_update(struct port *p, enum fsm_event event, int mdiff)
 		p->state = next;
 		port_notify_event(p, NOTIFY_PORT_STATE);
 		p->unicast_state_dirty = true;
+
+		if (shared_ptp_data) {
+			const char* state_str = port_state_string(next);
+			AcquirePtpSemaphoreLock(ptp_semaphore_id);
+			strncpy(shared_ptp_data->mode, state_str, sizeof(shared_ptp_data->mode) - 1);
+			shared_ptp_data->mode[sizeof(shared_ptp_data->mode) - 1] = '\0';
+			ReleasePtpSemaphoreLock(ptp_semaphore_id);
+		}
+
 		return 1;
 	}
 

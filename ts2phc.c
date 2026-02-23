@@ -21,6 +21,7 @@
 #include "sad.h"
 #include "ts2phc.h"
 #include "version.h"
+#include "nmea.h"
 
 #define NS_PER_SEC		1000000000LL
 #define SAMPLE_WEIGHT		1.0
@@ -140,7 +141,7 @@ static struct servo *ts2phc_servo_create(struct ts2phc_private *priv,
 	if (!servo)
 		return NULL;
 
-	servo_sync_interval(servo, SERVO_SYNC_INTERVAL);
+	servo_sync_interval(servo, priv->pulse_period / 1.0e9);
 
 	return servo;
 }
@@ -348,17 +349,25 @@ static void ts2phc_reconfigure(struct ts2phc_private *priv)
 			}
 			num_target_clocks++;
 			break;
-		case PS_UNCALIBRATED:
-			num_ref_clocks++;
-			break;
 		case PS_SLAVE:
 			ref_clk = c;
+			/* Fall through */
+		case PS_UNCALIBRATED:
 			num_ref_clocks++;
+			if (priv->external_pps && c->is_target) {
+				pr_info("unselecting %s for synchronization",
+					c->name);
+				c->is_target = false;
+			}
 			break;
 		default:
 			break;
 		}
 		last = c;
+	}
+	if (priv->external_pps) {
+		pr_info("assuming external reference clock");
+		return;
 	}
 	if (num_target_clocks >= 1 && !ref_clk) {
 		priv->ref_clock = last;
@@ -423,14 +432,23 @@ static int ts2phc_pps_source_implicit_tstamp(struct ts2phc_private *priv,
 	 *
 	 * With an NMEA source assume its messages always follow the pulse, i.e.
 	 * assign the timestamp to the previous pulse instead of nearest pulse.
+	 *
+	 * To support >1Hz PPS signals, work with the 1/rate period instead of
+	 * second.
 	 */
 	if (ts2phc_pps_source_get_type(priv->src) == TS2PHC_PPS_SOURCE_NMEA) {
-		source_ts.tv_sec++;
+		source_ts.tv_nsec += priv->pulse_period;
 	} else {
-		if (source_ts.tv_nsec > NS_PER_SEC / 2)
-			source_ts.tv_sec++;
+		source_ts.tv_nsec += priv->pulse_period / 2;
 	}
-	source_ts.tv_nsec = 0;
+
+	/* Truncate the timestamp to the pulse period boundary */
+	source_ts.tv_nsec /= priv->pulse_period;
+	source_ts.tv_nsec *= priv->pulse_period;
+	if (source_ts.tv_nsec >= NS_PER_SEC) {
+		source_ts.tv_sec++;
+		source_ts.tv_nsec -= NS_PER_SEC;
+	}
 
 	tmv = timespec_to_tmv(source_ts);
 	tmv = tmv_add(tmv, priv->perout_phase);
@@ -440,6 +458,12 @@ static int ts2phc_pps_source_implicit_tstamp(struct ts2phc_private *priv,
 	return 0;
 }
 
+static void update_shared_memory(int64_t offset, float freq, int servos) {
+	shared_ptp_data->ts_offset = offset;
+	shared_ptp_data->ts_frequency = freq;
+	shared_ptp_data->ts_servo_state = servos;
+}
+
 static void ts2phc_synchronize_clocks(struct ts2phc_private *priv, int autocfg)
 {
 	struct timespec source_ts, now;
@@ -447,7 +471,7 @@ static void ts2phc_synchronize_clocks(struct ts2phc_private *priv, int autocfg)
 	struct ts2phc_clock *c;
 	int holdover, valid;
 
-	if (autocfg) {
+	if (autocfg && !priv->external_pps) {
 		if (!priv->ref_clock) {
 			pr_debug("no reference clock, skipping");
 			return;
@@ -504,6 +528,7 @@ static void ts2phc_synchronize_clocks(struct ts2phc_private *priv, int autocfg)
 		if (c->no_adj) {
 			pr_info("%s offset %10" PRId64, c->name,
 				offset);
+			update_shared_memory(offset, 0, c->servo_state);
 			continue;
 		}
 
@@ -519,6 +544,7 @@ static void ts2phc_synchronize_clocks(struct ts2phc_private *priv, int autocfg)
 		pr_info("%s offset %10" PRId64 " s%d freq %+7.0f%s",
 			c->name, offset, c->servo_state, adj,
 			holdover ? " holdover" : "");
+		update_shared_memory(offset, adj, c->servo_state);
 
 		switch (c->servo_state) {
 		case SERVO_UNLOCKED:
@@ -609,6 +635,8 @@ int main(int argc, char *argv[])
 	int autocfg = 0;
 
 	handle_term_signals();
+	InitializePtpSemaphore(&ptp_semaphore_id);
+	InitializePtpSharedMemory(&ptp_shared_memory_id, &shared_ptp_data);
 
 	cfg = config_create();
 	if (!cfg) {
@@ -699,6 +727,10 @@ int main(int argc, char *argv[])
 	print_set_syslog(config_get_int(cfg, NULL, "use_syslog"));
 	print_set_level(config_get_int(cfg, NULL, "logging_level"));
 
+	/* Set this variable early for added sinks */
+	priv.pulse_period = NSEC_PER_SEC / config_get_int(cfg, NULL,
+							  "ts2phc.pulserate");
+
 	STAILQ_INIT(&priv.sinks);
 
 	if (sad_create(cfg)) {
@@ -707,8 +739,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	snprintf(uds_local, sizeof(uds_local), "/var/run/ts2phc.%d",
-		 getpid());
+	snprintf(uds_local, sizeof(uds_local), "/var/run/ts2phc.%d", getpid());
 
 	if (autocfg) {
 		err = init_pmc_node(cfg, priv.agent, uds_local,
@@ -786,6 +817,8 @@ int main(int argc, char *argv[])
 		ts2phc_cleanup(&priv);
 		return -1;
 	}
+
+	priv.external_pps = config_get_int(cfg, NULL, "ts2phc.external_pps");
 
 	priv.holdover_length = config_get_int(cfg, NULL, "ts2phc.holdover");
 	priv.holdover_start = 0;

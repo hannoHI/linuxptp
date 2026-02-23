@@ -65,7 +65,7 @@ static int tc_blocked(struct port *q, struct port *p, struct ptp_message *m)
 	if (!q->tc_spanning_tree) {
 		return 0;
 	}
-	/* Forward frames in the wrong domain unconditionally. */
+	/* Forward frames in the wrong domain unconditionally. TODO HANNO Why?*/
 	if (m->header.domainNumber != clock_domain_number(p->clock)) {
 		return 0;
 	}
@@ -453,7 +453,7 @@ int tc_fwd_sync(struct port *q, struct ptp_message *msg)
 		if (!fup) {
 			return -1;
 		}
-		fup->header.tsmt               = FOLLOW_UP | msg_transport_specific(msg);
+		fup->header.tsmt               = FOLLOW_UP | msg_transport_specific(msg); 
 		fup->header.ver                = msg->header.ver;
 		fup->header.messageLength      = htons(sizeof(struct follow_up_msg));
 		fup->header.domainNumber       = msg->header.domainNumber;

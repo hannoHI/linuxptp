@@ -20,6 +20,7 @@
 #include "filter_private.h"
 #include "mave.h"
 #include "mmedian.h"
+#include "mlog.h"
 
 struct filter *filter_create(enum filter_type type, int length)
 {
@@ -28,6 +29,8 @@ struct filter *filter_create(enum filter_type type, int length)
 		return mave_create(length);
 	case FILTER_MOVING_MEDIAN:
 		return mmedian_create(length);
+	case FILTER_MLOG:
+		return mlog_create(length);
 	default:
 		return NULL;
 	}

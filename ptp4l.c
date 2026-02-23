@@ -36,6 +36,7 @@
 #include "uds.h"
 #include "util.h"
 #include "version.h"
+#include "shared_ptp.h"
 
 static void usage(char *progname)
 {
@@ -181,6 +182,9 @@ int main(int argc, char *argv[])
 	if (config && (c = config_read(config, cfg))) {
 		return c;
 	}
+
+	InitializePtpSemaphore(&ptp_semaphore_id);
+	InitializePtpSharedMemory(&ptp_shared_memory_id, &shared_ptp_data);
 
 	print_set_progname(progname);
 	print_set_tag(config_get_string(cfg, NULL, "message_tag"));

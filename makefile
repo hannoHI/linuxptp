@@ -24,16 +24,16 @@ CFLAGS	= -Wall $(VER) $(incdefs) $(DEBUG) $(EXTRA_CFLAGS)
 LDLIBS	= -lm -lrt -pthread $(EXTRA_LDFLAGS)
 PRG	= ptp4l hwstamp_ctl nsm phc2sys phc_ctl pmc timemaster ts2phc tz2alt
 SECURITY = sad.o
-FILTERS	= filter.o mave.o mmedian.o
+FILTERS	= filter.o mave.o mmedian.o mlog.o
 SERVOS	= linreg.o ntpshm.o nullf.o pi.o refclock_sock.o servo.o
 TRANSP	= raw.o transport.o udp.o udp6.o uds.o
 TS2PHC	= ts2phc.o lstab.o nmea.o serial.o sock.o ts2phc_generic_pps_source.o \
- ts2phc_nmea_pps_source.o ts2phc_phc_pps_source.o ts2phc_pps_sink.o ts2phc_pps_source.o
+ ts2phc_nmea_pps_source.o ts2phc_phc_pps_source.o ts2phc_pps_sink.o ts2phc_pps_source.o shared_ptp.o
 OBJ	= bmc.o clock.o clockadj.o clockcheck.o config.o designated_fsm.o \
  e2e_tc.o fault.o $(FILTERS) fsm.o hash.o interface.o monitor.o msg.o phc.o \
  pmc_common.o port.o port_signaling.o pqueue.o print.o ptp4l.o p2p_tc.o rtnl.o \
  $(SECURITY) $(SERVOS) sk.o stats.o tc.o $(TRANSP) telecom.o tlv.o tsproc.o \
- unicast_client.o unicast_fsm.o unicast_service.o util.o version.o
+ unicast_client.o unicast_fsm.o unicast_service.o util.o version.o shared_ptp.o
 
 OBJECTS	= $(OBJ) hwstamp_ctl.o nsm.o phc2sys.o phc_ctl.o pmc.o pmc_agent.o \
  pmc_common.o sysoff.o timemaster.o $(TS2PHC) tz2alt.o
@@ -60,6 +60,10 @@ SECURITY += sad_gnupg.o
 else ifneq (,$(findstring -DHAVE_OPENSSL, $(incdefs)))
 LDLIBS += -lcrypto
 SECURITY += sad_openssl.o
+endif
+
+ifneq (,$(findstring -DHAVE_LIBCAP,$(incdefs)))
+LDLIBS += -lcap
 endif
 
 prefix	= /usr/local
@@ -89,7 +93,7 @@ timemaster: phc.o print.o rtnl.o sk.o timemaster.o util.o version.o
 
 ts2phc: config.o clockadj.o hash.o interface.o msg.o phc.o pmc_agent.o \
  pmc_common.o print.o $(SECURITY) $(SERVOS) sk.o $(TS2PHC) tlv.o transport.o \
- $(TRANSP) util.o version.o
+ $(TRANSP) util.o version.o shared_ptp.o
 
 tz2alt: config.o hash.o interface.o lstab.o msg.o phc.o pmc_common.o print.o \
  $(SECURITY) sk.o tlv.o $(TRANSP) tz2alt.o util.o version.o

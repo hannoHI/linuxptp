@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/queue.h>
+#include <sys/stat.h>
 
 #include "address.h"
 #include "bmc.h"
@@ -44,8 +45,13 @@
 #include "tlv.h"
 #include "tsproc.h"
 #include "tz.h"
+#include "shared_ptp.h"
 #include "uds.h"
 #include "util.h"
+
+/* External shared PTP data variables */
+extern int ptp_shared_memory_id, ptp_semaphore_id;
+extern struct SharedPtpData *shared_ptp_data;
 
 #define N_CLOCK_PFD (N_POLLFD + 1) /* one extra per port, for the fault timer */
 
@@ -917,6 +923,12 @@ static int clock_utc_correct(struct clock *c, tmv_t ingress)
 
 	utc_offset = c->utc_offset;
 
+	if (shared_ptp_data) {
+		AcquirePtpSemaphoreLock(ptp_semaphore_id);
+		shared_ptp_data->utc_offset = utc_offset;
+		ReleasePtpSemaphoreLock(ptp_semaphore_id);
+	}
+
 	if (c->tds.flags & LEAP_61) {
 		leap = 1;
 	} else if (c->tds.flags & LEAP_59) {
@@ -1104,12 +1116,22 @@ int clock_required_modes(struct clock *c)
 	return required_modes;
 }
 
+static void create_symlink(const char *target, const char *path)
+{
+	struct stat st;
+
+	if (!lstat(path, &st) && (st.st_mode & S_IFMT) == S_IFLNK)
+		return;
+	if (symlink(target, path))
+		pr_warning("failed to create symlink %s->%s: %m", path, target);
+}
+
 struct clock *clock_create(enum clock_type type, struct config *config,
 			   const char *phc_device)
 {
 	int conf_phc_index, i, max_adj = 0, phc_index, required_modes = 0, sfl, sw_ts;
 	enum servo_type servo = config_get_int(config, NULL, "clock_servo");
-	char ts_label[IF_NAMESIZE], phc[32], *tmp;
+	char ts_label[IF_NAMESIZE], phc[32], *tmp, *user;
 	enum timestamp_type timestamping;
 	struct clock *c = &the_clock;
 	const char *uds_ifname;
@@ -1268,9 +1290,14 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 		}
 	}
 
-	/* Configure the UDS. */
+	/*
+	 * Configure the UDS ports. If using the new default server addresses,
+	 * create also symlinks for compatibility with older clients.
+	 */
 
 	uds_ifname = config_get_string(config, NULL, "uds_address");
+	if (!strcmp(uds_ifname, "/var/run/ptp/ptp4l"))
+		create_symlink("ptp/ptp4l", "/var/run/ptp4l");
 	c->uds_rw_if = interface_create(uds_ifname, NULL);
 	if (config_set_section_int(config, interface_name(c->uds_rw_if),
 				   "announceReceiptTimeout", 0)) {
@@ -1291,6 +1318,8 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 
 	uds_ifname = config_get_string(config, NULL, "uds_ro_address");
 	c->uds_ro_if = interface_create(uds_ifname, NULL);
+	if (!strcmp(uds_ifname, "/var/run/ptp/ptp4lro"))
+		create_symlink("ptp/ptp4lro", "/var/run/ptp4lro");
 	if (config_set_section_int(config, interface_name(c->uds_ro_if),
 				   "announceReceiptTimeout", 0)) {
 		return NULL;
@@ -1429,6 +1458,12 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 		return NULL;
 	}
 
+	user = config_get_string(config, NULL, "user");
+	create_uds_directory(config_get_string(config, NULL, "uds_address"),
+			     user);
+	create_uds_directory(config_get_string(config, NULL, "uds_ro_address"),
+			     user);
+
 	/* Create the UDS interfaces. */
 
 	c->uds_rw_port = port_open(phc_device, phc_index, timestamping, 0,
@@ -1458,6 +1493,18 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 			return NULL;
 		}
 	}
+
+	/*
+	 * Drop the root privileges if configured to do so. It needs to be done
+	 * after opening the ports as generic netlink sockets (whose binding
+	 * requires CAP_SYS_ADMIN) are used to detect virtual clocks. The port
+	 * sockets will be bound and HW timestamping configured later when
+	 * handling the port INITIALIZING state. The process keeps
+	 * CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, and CAP_NET_RAW to be able to
+	 * do that.
+	 */
+	if (drop_root_privileges(user))
+		return NULL;
 
 	c->dds.numberPorts = c->nports;
 
@@ -2124,6 +2171,19 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 
 	clock_notify_event(c, NOTIFY_TIME_SYNC);
 
+	if (shared_ptp_data) {
+		struct timespec ptp_time;
+		AcquirePtpSemaphoreLock(ptp_semaphore_id);
+		shared_ptp_data->master_offset = (int)tmv_to_nanoseconds(c->master_offset);
+		shared_ptp_data->drift = (float)adj;
+		shared_ptp_data->mean_path_delay = (float)tmv_to_nanoseconds(c->path_delay);
+		if (clock_gettime(c->clkid, &ptp_time) == 0) {
+			shared_ptp_data->ptp_seconds = ptp_time.tv_sec;
+			shared_ptp_data->ptp_nanoseconds = ptp_time.tv_nsec;
+		}
+		ReleasePtpSemaphoreLock(ptp_semaphore_id);
+	}
+
 	return state;
 
 servo_unlock:
@@ -2228,6 +2288,12 @@ void clock_update_time_properties(struct clock *c, struct timePropertiesDS tds)
 	}
 
 	c->tds = tds;
+
+	if (shared_ptp_data) {
+		AcquirePtpSemaphoreLock(ptp_semaphore_id);
+		shared_ptp_data->utc_offset = c->utc_offset;
+		ReleasePtpSemaphoreLock(ptp_semaphore_id);
+	}
 }
 
 static void handle_state_decision_event(struct clock *c)
@@ -2325,8 +2391,29 @@ enum clock_type clock_type(struct clock *c)
 
 void clock_check_ts(struct clock *c, uint64_t ts)
 {
-	if (c->sanity_check && clockcheck_sample(c->sanity_check, ts)) {
-		servo_reset(c->servo);
+	// TODO: HANNO  how do I only reset the servo if the clockcheck_sample happens 2 times in a row?
+    //if (c->sanity_check && clockcheck_sample(c->sanity_check, ts)) {
+    //    servo_reset(c->servo);static int consecutive_failures = 0;
+	struct timespec now;
+	static struct timespec last_reset_time = {0, 0};
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	pr_debug("clock_check_ts called at %ld.%06ld", now.tv_sec, now.tv_nsec / 1000);
+	static int consecutive_failures = 0;
+	if (c->sanity_check) {
+		if (clockcheck_sample(c->sanity_check, ts)) {
+			consecutive_failures++;
+			if (consecutive_failures >= 2) {
+				pr_notice("clockcheck_sample failed twice in a row, resetting servo");
+				servo_reset(c->servo);
+				consecutive_failures = 0;
+				last_reset_time = now;
+			}
+		} else {
+			if ((now.tv_sec - last_reset_time.tv_sec > 2) || 
+			    (now.tv_sec - last_reset_time.tv_sec == 2 && now.tv_nsec >= last_reset_time.tv_nsec)) {
+				consecutive_failures = 0;
+			}
+		}
 	}
 }
 

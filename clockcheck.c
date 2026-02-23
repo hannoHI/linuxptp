@@ -75,8 +75,10 @@ int clockcheck_sample(struct clockcheck *cc, uint64_t ts)
 
 	if (!cc->freq_known)
 		return ret;
+    //if(ts==0) return ret;
 
 	interval = (int64_t)ts - cc->last_ts;
+	//pr_warning("clockcheck: interval=%"PRId64" us, ts=%"PRIu64" us, last_ts=%"PRIu64" us", interval / 1000, ts/1000, cc->last_ts/1000);
 	if (interval >= 0 && interval < CHECK_MIN_INTERVAL)
 		return ret;
 
@@ -86,6 +88,9 @@ int clockcheck_sample(struct clockcheck *cc, uint64_t ts)
 
 	if (mono_interval < CHECK_MIN_INTERVAL)
 		return ret;
+	/* Print debug information about the time interval in microseconds */
+	//pr_debug("clockcheck: interval=%"PRId64" us, mono_interval=%"PRId64" us",
+	//	 interval / 1000, mono_interval / 1000);
 
 	if (cc->last_ts && cc->max_freq <= CHECK_MAX_FREQ) {
 		max_foffset = 1e9 * (interval /
@@ -97,11 +102,11 @@ int clockcheck_sample(struct clockcheck *cc, uint64_t ts)
 
 		if (min_foffset > cc->freq_limit) {
 			pr_warning("clockcheck: clock jumped forward or"
-					" running faster than expected!");
+					" running faster than expected! %f > %d (%d), interval=%"PRId64" us, mono_interval=%"PRId64" us", min_foffset, cc->min_freq, cc->freq_limit, interval / 1000, mono_interval / 1000);
 			ret = 1;
 		} else if (max_foffset < -cc->freq_limit) {
 			pr_warning("clockcheck: clock jumped backward or"
-					" running slower than expected!");
+					" running slower than expected! %f < %d (%d), interval=%"PRId64" us, mono_interval=%"PRId64" us", max_foffset, cc->max_freq, cc->freq_limit, interval / 1000, mono_interval / 1000);
 			ret = 1;
 		}
 	}

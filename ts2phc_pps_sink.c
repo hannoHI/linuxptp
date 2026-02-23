@@ -152,6 +152,7 @@ static struct ts2phc_pps_sink *ts2phc_pps_sink_create(struct ts2phc_private *pri
 	struct config *cfg = priv->cfg;
 	struct ptp_extts_request extts;
 	struct ts2phc_pps_sink *sink;
+	const char *pin_name;
 	int32_t correction;
 	int err;
 
@@ -166,16 +167,19 @@ static struct ts2phc_pps_sink *ts2phc_pps_sink_create(struct ts2phc_private *pri
 		free(sink);
 		return NULL;
 	}
-	sink->pin_desc.index = config_get_int(cfg, device, "ts2phc.pin_index");
-	sink->pin_desc.func = PTP_PF_EXTTS;
-	sink->pin_desc.chan = config_get_int(cfg, device, "ts2phc.channel");
 	sink->polarity = config_get_int(cfg, device, "ts2phc.extts_polarity");
 	correction = config_get_int(cfg, device, "ts2phc.extts_correction");
 	sink->correction = nanoseconds_to_tmv(correction);
 
 	sink->pulsewidth = config_get_int(cfg, device, "ts2phc.pulsewidth");
-	if (sink->pulsewidth > 500000000)
-		sink->pulsewidth = 1000000000 - sink->pulsewidth;
+	if ((int32_t)sink->pulsewidth < 0)
+		sink->pulsewidth = priv->pulse_period / 2;
+	if (sink->pulsewidth > priv->pulse_period - 1000000) {
+		pr_err("pulsewidth is too large for configured pulserate");
+		return NULL;
+	}
+	if (sink->pulsewidth > priv->pulse_period / 2)
+		sink->pulsewidth = priv->pulse_period - sink->pulsewidth;
 
 	sink->clock = ts2phc_clock_add(priv, device);
 	if (!sink->clock) {
@@ -187,7 +191,23 @@ static struct ts2phc_pps_sink *ts2phc_pps_sink_create(struct ts2phc_private *pri
 	pr_debug("PPS sink %s has ptp index %d", device,
 		 sink->clock->phc_index);
 
+	pin_name = config_get_string(cfg, device, "ts2phc.pin_name");
+	if (pin_name[0]) {
+		sink->pin_desc.index = phc_get_pin_index(sink->clock->clkid,
+							 pin_name);
+		if (sink->pin_desc.index < 0)
+			return NULL;
+	} else {
+		sink->pin_desc.index = config_get_int(cfg, device,
+						      "ts2phc.pin_index");
+	}
+	sink->pin_desc.func = PTP_PF_EXTTS;
+	sink->pin_desc.chan = config_get_int(cfg, device, "ts2phc.channel");
+
 	if (phc_number_pins(sink->clock->clkid) > 0) {
+		pr_debug("PPS sink %s is using pin %d",
+			 device, sink->pin_desc.index);
+
 		err = phc_pin_setfunc(sink->clock->clkid, &sink->pin_desc);
 		if (err < 0) {
 			pr_err("PTP_PIN_SETFUNC request failed");
@@ -253,12 +273,12 @@ static bool ts2phc_pps_sink_ignore(struct ts2phc_private *priv,
 		ignore_upper = sink->pulsewidth;
 		ignore_lower = 0;
 	} else {
-		ignore_upper = 1000000000 - sink->pulsewidth / 2;
+		ignore_upper = priv->pulse_period - sink->pulsewidth / 2;
 		ignore_lower = sink->pulsewidth / 2;
 	}
 
-	return source_ts.tv_nsec > ignore_lower &&
-	       source_ts.tv_nsec < ignore_upper;
+	return source_ts.tv_nsec % priv->pulse_period > ignore_lower &&
+	       source_ts.tv_nsec % priv->pulse_period < ignore_upper;
 }
 
 static enum extts_result ts2phc_pps_sink_event(struct ts2phc_private *priv,
@@ -441,6 +461,15 @@ int ts2phc_pps_sink_poll(struct ts2phc_private *priv)
 		all_sinks_have_events = true;
 
 		for (i = 0; i < priv->n_sinks; i++) {
+			/*
+			 * In the external PPS mode don't require non-target
+			 * clocks to be receiving PPS to allow switching the
+			 * PPS direction to synchronize the external clock.
+			 */
+			if (priv->external_pps &&
+			    !polling_array->sink[i]->clock->is_target)
+				continue;
+
 			if (!polling_array->collected_events[i]) {
 				all_sinks_have_events = false;
 				break;

@@ -209,12 +209,16 @@ static int unicast_service_clients(struct port *p,
 			continue;
 		}
 		if (client->message_types & (1 << ANNOUNCE)) {
+			// pr_debug("hi_%s wants announce 0x%x", pid2str(&client->portIdentity), //TODO
+			// client->message_types);
 			if (port_tx_announce(p, &client->addr,
 					     client->seqnum.announce++)) {
 				err = -1;
 			}
 		}
 		if (client->message_types & (1 << SYNC)) {
+			// pr_debug("hi_%s wants sync 0x%x", pid2str(&client->portIdentity), //TODO
+			// client->message_types);
 			if (port_tx_sync(p, &client->addr,
 					 client->seqnum.sync++)) {
 				err = -1;
@@ -316,6 +320,7 @@ int unicast_service_add(struct port *p, struct ptp_message *m,
 	mtype = req->message_type >> 4;
 	mask = 1 << mtype;
 
+	//	pr_debug("hi_mtype %x, %x", mtype, mask); //TODO
 	switch (mtype) {
 	case ANNOUNCE:
 	case SYNC:

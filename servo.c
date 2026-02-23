@@ -30,6 +30,15 @@
 
 #include "print.h"
 
+#define SMALL_ADJUSTMENT_THRESHOLD_1 4000 // 0.25x adjustment threshold in nanoseconds
+#define SMALL_ADJUSTMENT_THRESHOLD_2 10000 // 0.333x adjustment threshold in nanoseconds
+#define MEDIUM_ADJUSTMENT_THRESHOLD 25000  // 0.5x adjustment threshold in nanoseconds
+#define LARGE_ADJUSTMENT_THRESHOLD 50000 // 0.75x Threshold for full adjustment in nanoseconds
+
+#define ADJUSTMENT_FACTOR_0_25 0.25 // Factor for 0.25 adjustment
+#define ADJUSTMENT_FACTOR_0_333 0.333 // Factor for 0.333 adjustment
+#define ADJUSTMENT_FACTOR_0_5 0.5 // Factor for 0.5 adjustment
+#define ADJUSTMENT_FACTOR_0_75 0.75 // Factor for 0.75 adjustment
 struct servo *servo_create(struct config *cfg, enum servo_type type,
 			   double fadj, int max_ppb, int sw_ts)
 {
@@ -120,6 +129,19 @@ double servo_sample(struct servo *servo,
 		    enum servo_state *state)
 {
 	double r;
+
+        // Apply custom filter logic for sync messages
+        int64_t abs_offset = llabs(offset);
+
+        if (abs_offset < SMALL_ADJUSTMENT_THRESHOLD_1) {
+                offset = (int64_t)(offset * ADJUSTMENT_FACTOR_0_25);
+        } else if (abs_offset < SMALL_ADJUSTMENT_THRESHOLD_2) {
+                offset = (int64_t)(offset * ADJUSTMENT_FACTOR_0_333);
+        } else if (abs_offset < MEDIUM_ADJUSTMENT_THRESHOLD) {
+                offset = (int64_t)(offset * ADJUSTMENT_FACTOR_0_5);
+        } else if (abs_offset < LARGE_ADJUSTMENT_THRESHOLD) {
+                offset = (int64_t)(offset * ADJUSTMENT_FACTOR_0_75);
+        }
 
 	r = servo->sample(servo, offset, local_ts, weight, state);
 

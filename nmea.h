@@ -8,6 +8,8 @@
 
 #include <stdbool.h>
 #include <time.h>
+#include <pthread.h>
+#include "shared_ptp.h"
 
 /** Opaque type. */
 struct nmea_parser;
@@ -40,5 +42,10 @@ struct nmea_parser *nmea_parser_create(void);
  * @param np	Pointer obtained via nmea_parser_create().
  */
 void nmea_parser_destroy(struct nmea_parser *np);
+
+extern pthread_mutex_t shm_mutex;
+extern int shm_id;
+extern struct SharedMemoryData *shared_data;
+//void initialize_shared_memory(void);
 
 #endif
